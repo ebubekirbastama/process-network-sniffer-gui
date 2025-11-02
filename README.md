@@ -86,9 +86,4 @@ Ağ politikalarınızı ve yerel mevzuatı ihlal etmeyecek şekilde kullanın �
 ## 📜 Lisans
 MIT — ayrıntı için `LICENSE` dosyasına bakın.
 
----
 
-## ❤️ Teşekkürler
-- 🐍 [Scapy](https://scapy.net/)
-- ⚙️ [psutil](https://github.com/giampaolo/psutil)
-- 🎨 [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter)

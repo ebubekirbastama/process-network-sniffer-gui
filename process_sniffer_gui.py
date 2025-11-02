@@ -1,8 +1,16 @@
 """
-Eklemeler:
-- AsyncSniffer (CPU yükü az)
-- Thread-safe QueueHandler logging (GUI freeze fix)
-- Arayüz seçimi (iface ComboBox)
+Process Network Sniffer GUI (CustomTkinter + Treeview)
+- Donma fix:
+  * Reverse DNS varsayılan KAPALI + checkbox
+  * Reverse DNS: LRU cache, özel IP’leri ve DNS paketi çözme YOK
+  * Her turda en fazla 200 paket işleme
+  * Maks 5000 satır
+  * net_connections güncelleme aralığı 5sn
+- Özellikler:
+  * TCP/UDP sniff, PID/Process/Path eşleme
+  * QUIC/HTTP3 ve DNS etiketleri
+  * Filtre: PID veya process adı, protokol
+  * CSV dışa aktar, seçili / tümünü panoya kopyala
 """
 
 import threading
@@ -11,9 +19,8 @@ import time
 import os
 import socket
 import psutil
-import logging
 from datetime import datetime
-from scapy.all import AsyncSniffer, IP, TCP, UDP, raw, get_if_list
+from scapy.all import sniff, IP, TCP, UDP, raw
 import re
 import tkinter as tk
 from tkinter import ttk
@@ -27,10 +34,10 @@ except Exception:
 
 # ------------------- AYARLAR -------------------
 PACKET_QUEUE_MAX = 2000
-UPDATE_CONNECTIONS_INTERVAL = 5.0
+UPDATE_CONNECTIONS_INTERVAL = 5.0  # daha seyrek
 PAYLOAD_PREVIEW_LEN = 200
 GUI_MAX_ROWS = 5000
-GUI_BATCH_PER_TICK = 200
+GUI_BATCH_PER_TICK = 200  # her 200ms'de en fazla 200 paket
 # ------------------------------------------------
 
 packet_q = queue.Queue(maxsize=PACKET_QUEUE_MAX)
@@ -38,25 +45,8 @@ stop_sniffer = threading.Event()
 conn_map = {}
 conn_map_lock = threading.Lock()
 
-# -------- Thread-safe Logging -----------
-log_queue = queue.Queue()
+# ----------- Yardımcılar: ağ & eşleme -----------
 
-class QueueHandler(logging.Handler):
-    """Thread-safe handler that sends logs to a queue."""
-    def __init__(self, log_q):
-        super().__init__()
-        self.log_q = log_q
-    def emit(self, record):
-        self.log_q.put(self.format(record))
-
-logger = logging.getLogger("sniffer")
-logger.setLevel(logging.INFO)
-handler = QueueHandler(log_queue)
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-
-# -------- Yardımcılar: ağ & eşleme --------
 def get_local_ips():
     ips = set()
     for iface, addrs in psutil.net_if_addrs().items():
@@ -68,8 +58,10 @@ def get_local_ips():
 
 def is_private_or_local(ip):
     try:
-        a = [int(x) for x in ip.split(".")]
-        if a[0] == 10 or a[0] == 127: return True
+        a = ip.split(".")
+        a = [int(x) for x in a]
+        if a[0] == 10: return True
+        if a[0] == 127: return True
         if a[0] == 192 and a[1] == 168: return True
         if a[0] == 172 and 16 <= a[1] <= 31: return True
     except Exception:
@@ -124,6 +116,7 @@ def map_packet_to_process(pkt, local_ips):
         key = (proto, laddr_ip, lport)
         if key in conn_map:
             return (*conn_map[key], key)
+        # farklı arayüz IP eşleşmesi için port wildcard
         for (p_proto, p_ip, p_port), (pid, pname) in conn_map.items():
             if p_proto == proto and p_port == lport:
                 return (pid, pname, (p_proto, p_ip, p_port))
@@ -156,7 +149,22 @@ def pkt_summary(pkt):
         'payload_len': len(payload)
     }
 
+def scapy_packet_callback(pkt):
+    try:
+        packet_q.put(pkt, timeout=0.05)
+    except queue.Full:
+        # drop oldest
+        try:
+            packet_q.get_nowait()
+            packet_q.put(pkt, timeout=0.01)
+        except Exception:
+            pass
+
+def sniffer_thread():
+    sniff(prn=scapy_packet_callback, filter="tcp or udp", store=False, stop_filter=lambda x: stop_sniffer.is_set())
+
 # ------------------------- GUI -------------------------
+
 class NetSnifferGUI:
     def __init__(self, root):
         self.root = root
@@ -164,49 +172,79 @@ class NetSnifferGUI:
         self.running = False
         self.conn_thread = None
         self.sniff_thread = None
-        self.sniffer = None
-        self.selected_iface = None
 
         self.setup_ui()
+        # Kısayollar
+        self.root.bind("<Control-c>", lambda e: self.copy_selected())
+        self.root.bind("<Control-s>", lambda e: self.save_log())
         self.root.after(200, self.update_gui)
-        self.root.after(300, self.process_log_queue)
 
     def setup_ui(self):
         if CTK_AVAILABLE:
             ctk.set_appearance_mode("dark")
             ctk.set_default_color_theme("green")
-        self.root.title("Process Network Sniffer (AsyncSniffer + QueueLog)")
-        self.root.geometry("1300x750")
+            self.root.title("Process Network Sniffer (Tablo)")
+            self.root.geometry("1300x750")
+        else:
+            self.root.title("Process Network Sniffer")
+            self.root.geometry("1300x750")
 
+        # Üst çubuk
         top = ctk.CTkFrame(self.root) if CTK_AVAILABLE else ttk.Frame(self.root)
         top.pack(fill="x", pady=5)
+        btn_style = {"padx": 5, "pady": 3}
 
-        # Butonlar
-        self.start_btn = ctk.CTkButton(top, text="Start", command=self.toggle_sniffer) if CTK_AVAILABLE else ttk.Button(top, text="Start", command=self.toggle_sniffer)
-        self.stop_btn = ctk.CTkButton(top, text="Stop", command=self.toggle_sniffer, state="disabled") if CTK_AVAILABLE else ttk.Button(top, text="Stop", command=self.toggle_sniffer, state="disabled")
-        self.clear_btn = ctk.CTkButton(top, text="Clear", command=self.clear_table) if CTK_AVAILABLE else ttk.Button(top, text="Clear", command=self.clear_table)
-        for b in [self.start_btn, self.stop_btn, self.clear_btn]:
-            b.pack(side="left", padx=5)
+        if CTK_AVAILABLE:
+            self.start_btn = ctk.CTkButton(top, text="Start", command=self.toggle_sniffer)
+            self.stop_btn = ctk.CTkButton(top, text="Stop", command=self.toggle_sniffer, state="disabled")
+            self.clear_btn = ctk.CTkButton(top, text="Clear", command=self.clear_table)
+            self.copy_btn = ctk.CTkButton(top, text="Copy Seçilen", command=self.copy_selected)
+            self.copy_all_btn = ctk.CTkButton(top, text="Copy Tümü", command=self.copy_all)
+            self.save_btn = ctk.CTkButton(top, text="Save Log (CSV)", command=self.save_log)
+        else:
+            self.start_btn = ttk.Button(top, text="Start", command=self.toggle_sniffer)
+            self.stop_btn = ttk.Button(top, text="Stop", command=self.toggle_sniffer, state="disabled")
+            self.clear_btn = ttk.Button(top, text="Clear", command=self.clear_table)
+            self.copy_btn = ttk.Button(top, text="Copy Seçilen", command=self.copy_selected)
+            self.copy_all_btn = ttk.Button(top, text="Copy Tümü", command=self.copy_all)
+            self.save_btn = ttk.Button(top, text="Save Log (CSV)", command=self.save_log)
 
-        # Arayüz seçimi
-        ttk.Label(top, text="Interface:").pack(side="left", padx=5)
-        self.iface_var = tk.StringVar()
-        iface_list = get_if_list()
-        self.iface_box = ttk.Combobox(top, values=iface_list, textvariable=self.iface_var, width=20)
-        if iface_list:
-            self.iface_box.set(iface_list[0])
-        self.iface_box.pack(side="left", padx=5)
+        for b in [self.start_btn, self.stop_btn, self.clear_btn, self.copy_btn, self.copy_all_btn, self.save_btn]:
+            b.pack(side="left", **btn_style)
+
+        # Filtre ve protokol
+        self.filter_entry = ttk.Entry(top)
+        self.filter_entry.pack(side="left", padx=5, fill="x", expand=True)
+
+        self.proto_var = ctk.StringVar(value="all") if CTK_AVAILABLE else tk.StringVar(value="all")
+        self.proto_menu = ttk.Combobox(top, values=["all", "tcp", "udp"], textvariable=self.proto_var, width=6)
+        self.proto_menu.pack(side="right", padx=5)
+
+        # Reverse DNS toggle (varsayılan kapalı)
+        self.rdns_var = ctk.BooleanVar(value=False) if CTK_AVAILABLE else tk.BooleanVar(value=False)
+        rdns_text = "Reverse DNS (dikkat: yavaşlatır)" 
+        self.rdns_chk = ctk.CTkCheckBox(top, text=rdns_text, variable=self.rdns_var) if CTK_AVAILABLE else ttk.Checkbutton(top, text=rdns_text, variable=self.rdns_var)
+        self.rdns_chk.pack(side="right", padx=10)
 
         # Tablo
-        columns = ("Time", "PID", "Process", "Proto", "Source", "Destination", "Len", "Payload")
+        columns = ("Time", "PID", "Process", "Path", "Proto", "Source", "Destination", "Len", "Payload")
         self.tree = ttk.Treeview(self.root, columns=columns, show="headings", selectmode="extended")
         for col in columns:
             self.tree.heading(col, text=col)
-            self.tree.column(col, width=160, anchor="w")
+            if col in ["Path", "Payload"]:
+                self.tree.column(col, width=320, anchor="w")
+            elif col in ["Source", "Destination"]:
+                self.tree.column(col, width=220, anchor="w")
+            else:
+                self.tree.column(col, width=120, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Scrollbars
         y_scroll = ttk.Scrollbar(self.tree, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=y_scroll.set)
+        x_scroll = ttk.Scrollbar(self.tree, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
         y_scroll.pack(side="right", fill="y")
+        x_scroll.pack(side="bottom", fill="x")
 
     def toggle_sniffer(self):
         if not self.running:
@@ -214,35 +252,80 @@ class NetSnifferGUI:
             self.start_btn.configure(state="disabled")
             self.stop_btn.configure(state="normal")
             stop_sniffer.clear()
-            self.selected_iface = self.iface_var.get()
-            logger.info(f"Sniffer started on interface: {self.selected_iface}")
-
-            # Conn map thread
             self.conn_thread = threading.Thread(target=conn_map_updater, daemon=True)
             self.conn_thread.start()
-
-            # AsyncSniffer
-            self.sniffer = AsyncSniffer(
-                iface=self.selected_iface,
-                prn=lambda pkt: packet_q.put(pkt) if not packet_q.full() else None,
-                filter="tcp or udp",
-                store=False
-            )
-            self.sniffer.start()
+            self.sniff_thread = threading.Thread(target=sniffer_thread, daemon=True)
+            self.sniff_thread.start()
+            self.add_row(["INFO", "-", "Sniffer Started", "", "", "", "", "", ""])
         else:
             stop_sniffer.set()
-            if self.sniffer:
-                self.sniffer.stop()
             self.running = False
             self.start_btn.configure(state="normal")
             self.stop_btn.configure(state="disabled")
-            logger.info("Sniffer stopped")
+            self.add_row(["INFO", "-", "Sniffer Stopped", "", "", "", "", "", ""])
+
+    def add_row(self, values):
+        # satır limiti
+        if len(self.tree.get_children()) >= GUI_MAX_ROWS:
+            # en eski 500'ü sil
+            for iid in self.tree.get_children()[:500]:
+                self.tree.delete(iid)
+        self.tree.insert("", "end", values=values)
+        self.tree.yview_moveto(1)
 
     def clear_table(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
 
+    def save_log(self):
+        fn = f"sniffer_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        headers = ["Time", "PID", "Process", "Path", "Proto", "Source", "Destination", "Len", "Payload"]
+        try:
+            with open(fn, "w", encoding="utf-8") as f:
+                f.write(",".join(headers) + "\n")
+                for item in self.tree.get_children():
+                    row = [str(v) for v in self.tree.item(item)["values"]]
+                    row = [v if "," not in v else f"\"{v}\"" for v in row]
+                    f.write(",".join(row) + "\n")
+            self.add_row(["INFO", "-", "Log Saved", fn, "", "", "", "", ""])
+        except Exception as e:
+            self.add_row(["ERROR", "-", f"CSV hata: {e}", "", "", "", "", "", ""])
+
+    def copy_selected(self):
+        try:
+            selected = self.tree.selection()
+            if not selected:
+                return
+            rows = []
+            for item in selected:
+                row = [str(v) for v in self.tree.item(item)["values"]]
+                row = [v if "," not in v else f"\"{v}\"" for v in row]
+                rows.append(",".join(row))
+            data = "\n".join(rows)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(data)
+            self.add_row(["INFO", "-", "Seçilen satır(lar) panoya kopyalandı", "", "", "", "", "", ""])
+        except Exception as e:
+            self.add_row(["ERROR", "-", f"Kopyalama hatası: {e}", "", "", "", "", "", ""])
+
+    def copy_all(self):
+        try:
+            rows = []
+            headers = ["Time", "PID", "Process", "Path", "Proto", "Source", "Destination", "Len", "Payload"]
+            rows.append(",".join(headers))
+            for item in self.tree.get_children():
+                row = [str(v) for v in self.tree.item(item)["values"]]
+                row = [v if "," not in v else f"\"{v}\"" for v in row]
+                rows.append(",".join(row))
+            data = "\n".join(rows)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(data)
+            self.add_row(["INFO", "-", "Tablonun tamamı panoya kopyalandı", "", "", "", "", "", ""])
+        except Exception as e:
+            self.add_row(["ERROR", "-", f"Kopyalama hatası: {e}", "", "", "", "", "", ""])
+
     def update_gui(self):
+        # Her tick’te en fazla GUI_BATCH_PER_TICK paket işle
         processed = 0
         try:
             while processed < GUI_BATCH_PER_TICK:
@@ -253,43 +336,87 @@ class NetSnifferGUI:
             pass
         self.root.after(200, self.update_gui)
 
-    def process_log_queue(self):
-        """Thread-safe log kuyruğundaki mesajları GUI’ye ekle."""
+    # ----------- DNS çözümleme: güvenli & cache'li -----------
+    @lru_cache(maxsize=1000)
+    def safe_rdns(self, ip):
+        # Özel IP veya loopback → çözme
+        if is_private_or_local(ip):
+            return ip
         try:
-            while True:
-                msg = log_queue.get_nowait()
-                self.add_row(["INFO", "-", msg, "-", "-", "-", "-", "-"])
-        except queue.Empty:
-            pass
-        self.root.after(500, self.process_log_queue)
-
-    def add_row(self, values):
-        if len(self.tree.get_children()) >= GUI_MAX_ROWS:
-            for iid in self.tree.get_children()[:500]:
-                self.tree.delete(iid)
-        self.tree.insert("", "end", values=values)
-        self.tree.yview_moveto(1)
+            # 100ms gecikmeleri engellemek için timeout (global yok; gethostbyaddr bloklar)
+            # Bloklamayı azaltmak için sadece RDNS açıkken ve nadiren kullanacağız.
+            return socket.gethostbyaddr(ip)[0]
+        except Exception:
+            return ip
 
     def handle_packet(self, pkt):
+        def get_proc_exe_path(pid):
+            try:
+                return psutil.Process(pid).exe()
+            except Exception:
+                return "-"
+
+        def clean_payload(data):
+            if not data:
+                return ""
+            text = ''.join(ch if 32 <= ord(ch) < 127 else '.' for ch in data)
+            text = re.sub(r'\s+', ' ', text)
+            return text.strip()
+
         try:
             local_ips = get_local_ips()
             pid, pname, key = map_packet_to_process(pkt, local_ips)
             s = pkt_summary(pkt)
+            proto = s.get("proto", "").lower()
+            if self.proto_var.get() != "all" and self.proto_var.get() != proto:
+                return
+
+            userfilter = self.filter_entry.get().strip()
+            if userfilter:
+                if userfilter.isdigit():
+                    if not pid or str(pid) != userfilter:
+                        return
+                else:
+                    if not pname or userfilter.lower() not in pname.lower():
+                        return
+
+            # Etiketler
+            label = ""
+            if proto == "udp" and (str(s["sport"]) == "443" or str(s["dport"]) == "443"):
+                label = "QUIC/HTTP3"
+            elif proto == "udp" and (str(s["sport"]) == "53" or str(s["dport"]) == "53"):
+                label = "DNS"
+
+            # Reverse DNS sadece checkbox açıksa, DNS paketlerinde ASLA yapma
+            use_rdns = bool(self.rdns_var.get())
+            if use_rdns and label != "DNS":
+                src_disp = self.safe_rdns(s["src"])
+                dst_disp = self.safe_rdns(s["dst"])
+            else:
+                src_disp = s["src"]
+                dst_disp = s["dst"]
+
+            proc_path = get_proc_exe_path(pid)
+            payload = clean_payload(s["payload_preview"])
+            proto_disp = f"{proto.upper()} ({label})" if label else proto.upper()
+
             row = [
                 s["time"],
                 pid or "-",
                 pname or "-",
-                s["proto"],
-                f"{s['src']}:{s['sport']}",
-                f"{s['dst']}:{s['dport']}",
+                proc_path,
+                proto_disp,
+                f"{src_disp}:{s['sport']}",
+                f"{dst_disp}:{s['dport']}",
                 s["payload_len"],
-                s["payload_preview"][:120]
+                payload[:200]
             ]
             self.add_row(row)
         except Exception as e:
-            logger.error(f"Packet parse error: {e}")
+            self.add_row(["ERROR", "-", str(e), "", "", "", "", "", ""])
 
 # ------------------------ main ------------------------
+
 if __name__ == "__main__":
     root = ctk.CTk() if CTK_AVAILABLE else tk.Tk()
     app = NetSnifferGUI(root)
